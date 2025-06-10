@@ -18,14 +18,20 @@ class GridWorldEnv(gym.Env):
     def __init__(self, render_mode=None, size=5):
         self.size = size  # The size of the square grid
         self.window_size = 512  # The size of the PyGame window
+        self.num_walls = 5
+        self.num_pits = self.np_random.integers(3, 6) if hasattr(self, 'np_random') else 3  # 3 to 5 pits
 
-        # Observations are dictionaries with the agent's and the target's location.
-        # Each location is encoded as an element of {0, ..., `size`}^2,
-        # i.e. MultiDiscrete([size, size]).
+        # Add special tiles A and B
+        self.special_names = ["A", "B"]
+
         self.observation_space = spaces.Dict(
             {
                 "agent": spaces.Box(0, size - 1, shape=(2,), dtype=int),
                 "target": spaces.Box(0, size - 1, shape=(2,), dtype=int),
+                "walls": spaces.Box(0, size - 1, shape=(self.num_walls, 2), dtype=int),
+                "pits": spaces.Box(0, size - 1, shape=(5, 2), dtype=int),  # Max 5 pits
+                "A": spaces.Box(0, size - 1, shape=(2,), dtype=int),
+                "B": spaces.Box(0, size - 1, shape=(2,), dtype=int),
             }
         )
 
@@ -58,8 +64,23 @@ class GridWorldEnv(gym.Env):
         self.clock = None
 
     def _get_obs(self):
-        return {"agent": self._agent_location, "target": self._target_location}
-
+        # Uzupełnij pits do 5 elementów
+        pits_obs = np.full((5, 2), -1, dtype=int)
+        for i, pit in enumerate(self._pits):
+            pits_obs[i] = pit.astype(int)
+        # Uzupełnij walls do self.num_walls elementów
+        walls_obs = np.full((self.num_walls, 2), -1, dtype=int)
+        for i, wall in enumerate(self._walls):
+            walls_obs[i] = wall.astype(int)
+        return {
+            "agent": self._agent_location.astype(int),
+            "target": self._target_location.astype(int),
+            "walls": walls_obs,
+            "pits": pits_obs,
+            "A": self._A_location.astype(int),
+            "B": self._B_location.astype(int),
+        }
+    
     def _get_info(self):
         return {
             "distance": np.linalg.norm(
@@ -68,19 +89,63 @@ class GridWorldEnv(gym.Env):
         }
 
     def reset(self, seed=None, options=None):
-        # We need the following line to seed self.np_random
         super().reset(seed=seed)
-
-        # Choose the agent's location uniformly at random
         self._agent_location = self.np_random.integers(0, self.size, size=2, dtype=int)
 
-        # We will sample the target's location randomly until it does not
-        # coincide with the agent's location
+        # Place target not on agent
         self._target_location = self._agent_location
         while np.array_equal(self._target_location, self._agent_location):
             self._target_location = self.np_random.integers(
                 0, self.size, size=2, dtype=int
             )
+
+        # Place walls not on agent or target, and not overlapping each other
+        self._walls = []
+        while len(self._walls) < self.num_walls:
+            wall = self.np_random.integers(0, self.size, size=2, dtype=int)
+            if (
+                not np.array_equal(wall, self._agent_location)
+                and not np.array_equal(wall, self._target_location)
+                and not any(np.array_equal(wall, w) for w in self._walls)
+            ):
+                self._walls.append(wall)
+
+        # Place pits not on agent, target, or walls, and not overlapping each other
+        self.num_pits = self.np_random.integers(3, 6)
+        self._pits = []
+        while len(self._pits) < self.num_pits:
+            pit = self.np_random.integers(0, self.size, size=2, dtype=int)
+            if (
+                not np.array_equal(pit, self._agent_location)
+                and not np.array_equal(pit, self._target_location)
+                and not any(np.array_equal(pit, w) for w in self._walls)
+                and not any(np.array_equal(pit, p) for p in self._pits)
+            ):
+                self._pits.append(pit)
+                
+        # Place special tiles A and B, not on agent, target, walls, pits, or each other
+        self._A_location = self._agent_location
+        while (
+            np.array_equal(self._A_location, self._agent_location)
+            or np.array_equal(self._A_location, self._target_location)
+            or any(np.array_equal(self._A_location, w) for w in self._walls)
+            or any(np.array_equal(self._A_location, p) for p in self._pits)
+        ):
+            self._A_location = self.np_random.integers(0, self.size, size=2, dtype=int)
+
+        self._B_location = self._A_location
+        while (
+            np.array_equal(self._B_location, self._agent_location)
+            or np.array_equal(self._B_location, self._target_location)
+            or any(np.array_equal(self._B_location, w) for w in self._walls)
+            or any(np.array_equal(self._B_location, p) for p in self._pits)
+            or np.array_equal(self._B_location, self._A_location)
+        ):
+            self._B_location = self.np_random.integers(0, self.size, size=2, dtype=int)
+
+        # Track if A or B have been visited this episode
+        self._visited_A = False
+        self._visited_B = False
 
         observation = self._get_obs()
         info = self._get_info()
@@ -91,15 +156,41 @@ class GridWorldEnv(gym.Env):
         return observation, info
 
     def step(self, action):
-        # Map the action (element of {0,1,2,3}) to the direction we walk in
         direction = self._action_to_direction[action]
-        # We use `np.clip` to make sure we don't leave the grid
-        self._agent_location = np.clip(
+        proposed_location = np.clip(
             self._agent_location + direction, 0, self.size - 1
         )
-        # An episode is done iff the agent has reached the target
-        terminated = np.array_equal(self._agent_location, self._target_location)
-        reward = 1 if terminated else 0  # Binary sparse rewards
+
+        # Prevent moving into a wall
+        if any(np.array_equal(proposed_location, w) for w in self._walls):
+            new_location = self._agent_location
+        else:
+            new_location = proposed_location
+
+        self._agent_location = new_location
+
+        # Check for pit
+        in_pit = any(np.array_equal(self._agent_location, p) for p in self._pits)
+        reached_target = np.array_equal(self._agent_location, self._target_location)
+        reached_A = np.array_equal(self._agent_location, self._A_location)
+        reached_B = np.array_equal(self._agent_location, self._B_location)
+
+        terminated = reached_target or in_pit or (reached_B and not self._visited_B)
+        reward = -0.1
+
+        if reached_target:
+            reward = 1
+        elif in_pit:
+            reward = -10
+        # Give +10 for first time on A
+        if reached_A and not self._visited_A:
+            reward += 10
+            self._visited_A = True
+        # Give +10 for first time on B, and terminate
+        if reached_B and not self._visited_B:
+            reward += 10
+            self._visited_B = True
+
         observation = self._get_obs()
         info = self._get_info()
 
@@ -107,6 +198,7 @@ class GridWorldEnv(gym.Env):
             self._render_frame()
 
         return observation, reward, terminated, False, info
+
 
     def render(self):
         if self.render_mode == "rgb_array":
@@ -122,10 +214,48 @@ class GridWorldEnv(gym.Env):
 
         canvas = pygame.Surface((self.window_size, self.window_size))
         canvas.fill((255, 255, 255))
-        pix_square_size = (
-            self.window_size / self.size
-        )  # The size of a single grid square in pixels
+        pix_square_size = self.window_size / self.size
 
+        # Draw walls
+        for wall in self._walls:
+            pygame.draw.rect(
+                canvas,
+                (128, 128, 128),  # Gray color for walls
+                pygame.Rect(
+                    pix_square_size * wall,
+                    (pix_square_size, pix_square_size),
+                ),
+            )
+        
+        for pit in self._pits:
+            pygame.draw.rect(
+                canvas,
+                (0, 0, 0),  # Black color for pits
+                pygame.Rect(
+                    pix_square_size * pit,
+                    (pix_square_size, pix_square_size),
+                ),
+            )
+
+        # Draw special tile A (green)
+        pygame.draw.rect(
+            canvas,
+            (0, 200, 0),
+            pygame.Rect(
+                pix_square_size * self._A_location,
+                (pix_square_size, pix_square_size),
+            ),
+        )
+        # Draw special tile B (yellow)
+        pygame.draw.rect(
+            canvas,
+            (255, 255, 0),
+            pygame.Rect(
+                pix_square_size * self._B_location,
+                (pix_square_size, pix_square_size),
+            ),
+        )
+        
         # First we draw the target
         pygame.draw.rect(
             canvas,

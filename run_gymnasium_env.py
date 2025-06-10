@@ -5,8 +5,14 @@ from gymnasium.wrappers import FlattenObservation
 
 
 env = gymnasium.make('gymnasium_env/GridWorld-v0', size=5)
-wrapped_env = FlattenObservation(env)
-print(wrapped_env.reset())
 
-wrapped_env = RelativePosition(env)
-print(wrapped_env.reset())  
+observation, info = env.reset()
+
+done = False
+while not done:
+    action = env.action_space.sample()  # losowa akcja
+    observation, reward, terminated, truncated, info = env.step(action)
+    print(reward, observation, info)
+    done = terminated or truncated
+
+env.close()
